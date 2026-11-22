@@ -29,6 +29,12 @@ func (s *subscriber) Subscribe(handler func(msg []byte, replySubject string)) er
 		return errors.New("already subscribed")
 	}
 	subscription, err := s.conn.QueueSubscribe(s.subject, s.queue, func(msg *nats.Msg) {
+		// A status-only message (e.g. 503 "no responders" sent to a reply
+		// inbox while the service is down) is not a reply: its empty body
+		// would decode as a valid empty response, such as "no desired VMs".
+		if len(msg.Data) == 0 && msg.Header.Get("Status") != "" {
+			return
+		}
 		handler(msg.Data, msg.Reply)
 	})
 	if err != nil {

@@ -15,9 +15,12 @@ func RegistrationReqToDomain(req *api.RegistrationReq) (*domain.RegistrationReq,
 		labels = append(labels, label)
 	}
 	return &domain.RegistrationReq{
-		Labels:      labels,
-		Resources:   req.Resources,
-		BindAddress: req.BindAddress,
+		NodeId:       req.NodeId,
+		Labels:       labels,
+		Resources:    req.Resources,
+		BindAddress:  req.BindAddress,
+		Capabilities: req.Capabilities,
+		OsStatus:     OsStatusToDomain(req.OsStatus),
 	}, nil
 }
 
@@ -25,4 +28,28 @@ func RegistrationRespFromDomain(resp domain.RegistrationResp) (*api.Registration
 	return &api.RegistrationResp{
 		NodeId: resp.NodeId,
 	}, nil
+}
+
+func NodeUpdateReqToDomain(req *api.NodeUpdateReq) (*domain.NodeUpdateReq, error) {
+	return &domain.NodeUpdateReq{
+		NodeId: domain.NodeId{
+			Value: req.NodeId,
+		},
+		Capabilities: req.Capabilities,
+		OsStatus:     OsStatusToDomain(req.OsStatus),
+	}, nil
+}
+
+func NodeUpdateRespFromDomain(resp domain.NodeUpdateResp) (*api.NodeUpdateResp, error) {
+	return &api.NodeUpdateResp{Found: !resp.NotFound, NotFound: resp.NotFound}, nil
+}
+
+func NodeHeartbeatReqToDomain(req *api.NodeHeartbeatReq) *domain.NodeHeartbeatReq {
+	return &domain.NodeHeartbeatReq{
+		NodeId: domain.NodeId{Value: req.NodeId},
+	}
+}
+
+func NodeHeartbeatRespFromDomain(resp domain.NodeHeartbeatResp) *api.NodeHeartbeatResp {
+	return &api.NodeHeartbeatResp{Found: resp.Found}
 }

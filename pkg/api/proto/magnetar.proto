@@ -18,6 +18,12 @@ service Magnetar {
   rpc PutStringLabel(PutStringLabelReq) returns (PutLabelResp) {}
   rpc DeleteLabel(DeleteLabelReq) returns (DeleteLabelResp) {}
   rpc ListAllNodes(ListAllNodesReq) returns (ListAllNodesResp) {}
+  rpc SetDesiredVms(VmDesiredSetReq) returns (VmDesiredSetResp) {}
+  rpc GetDesiredVms(VmDesiredGetReq) returns (VmDesiredGetResp) {}
+  rpc GetVmStatuses(VmStatusGetReq) returns (VmStatusGetResp) {}
+  rpc SetVmStatuses(VmStatusSetReq) returns (VmStatusSetResp) {}
+  rpc SetDesiredOsImage(DesiredOsImageSetReq) returns (DesiredOsImageSetResp) {}
+  rpc DeleteNode(DeleteNodeReq) returns (DeleteNodeResp) {}
 }
 
 message GetFromNodePoolReq {
@@ -50,6 +56,42 @@ message ListAllNodesReq { }
 
 message ListAllNodesResp {
   repeated NodeStringified nodes = 1;
+}
+
+// VM management: desired VMs are a standing declaration on the host
+// node record (phase-next.md §2.3 Q1). The CP writes them (gateway/cockpit),
+// the host's Star polls them over NATS and reports observed status back.
+message VmDesiredGetReq {
+  string hostId = 1;
+}
+
+message VmDesiredGetResp {
+  repeated DesiredVm vms = 1;
+}
+
+message VmDesiredSetReq {
+  string hostId = 1;
+  repeated DesiredVm vms = 2;
+}
+
+message VmDesiredSetResp {
+  repeated DesiredVm vms = 1;
+}
+
+message VmStatusGetReq {
+  string hostId = 1;
+}
+
+message VmStatusGetResp {
+  repeated VmStatus statuses = 1;
+}
+
+message VmStatusSetReq {
+  string hostId = 1;
+  repeated VmStatus statuses = 2;
+}
+
+message VmStatusSetResp {
 }
 
 message ListNodePoolReq { }
@@ -119,4 +161,34 @@ message DeleteLabelReq {
 
 message DeleteLabelResp {
   NodeStringified node = 1;
+}
+
+// Operator intent for a node's OS. An absent image clears it.
+message DesiredOsImageSetReq {
+  string nodeId = 1;
+  DesiredOsImage image = 2;
+}
+
+message DesiredOsImageSetResp {}
+
+// DeleteNode removes a node record completely: the record itself, its label
+// index entries, its liveness state and its desired OS intent. Org-owned
+// nodes are never removed automatically (GC only reaps pool records); this
+// RPC is the explicit operator path for them. VMs declared on a deleted host
+// keep running — their own node records are separate.
+message DeleteNodeReq {
+  string nodeId = 1;
+}
+
+message DeleteNodeResp {}
+
+// Node pull over NATS (magnetar.os.desired.get).
+message DesiredOsImageGetReq {
+  string nodeId = 1;
+}
+
+// image is absent when nothing is declared; notFound when the node is unknown.
+message DesiredOsImageGetResp {
+  DesiredOsImage image = 1;
+  bool notFound = 2;
 }

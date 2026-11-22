@@ -2,9 +2,11 @@ package repos
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/c12s/magnetar/internal/domain"
@@ -20,6 +22,10 @@ import (
 // for query operations
 // key - labels/pool/{labelKey}/{nodeId} | labels/orgs/{orgId}/{labelKey}/{nodeId}
 // value - protobuf label (key + value)
+// desired OS image (own key: status reports rewrite the node record, a
+// read-modify-write there would race with and drop operator intent)
+// key - desired_os/{nodeId}
+// value - json DesiredOsImage
 
 type nodeEtcdRepo struct {
 	etcd            *etcd.Client
@@ -36,6 +42,7 @@ func NewNodeEtcdRepo(etcd *etcd.Client, nodeMarshaller domain.NodeMarshaller, la
 }
 
 func (n nodeEtcdRepo) Put(node domain.Node) error {
+	node.DesiredOsImage = nil // stored under its own key, see PutDesiredOsImage
 	err := n.putNodeGetModel(node)
 	if err != nil {
 		return err
@@ -58,9 +65,41 @@ func (n nodeEtcdRepo) Get(nodeId domain.NodeId, org string) (*domain.Node, error
 		return nil, err
 	}
 	if resp.Count == 0 {
-		return nil, errors.New("node not found")
+		return nil, domain.ErrNodeNotFound
 	}
-	return n.nodeMarshaller.Unmarshal(resp.Kvs[0].Value)
+	node, err := n.nodeMarshaller.Unmarshal(resp.Kvs[0].Value)
+	if err != nil {
+		return nil, err
+	}
+	return n.withView(node)
+}
+
+func (n nodeEtcdRepo) FindById(nodeId domain.NodeId) (*domain.Node, error) {
+	node, err := n.Get(nodeId, "")
+	if !errors.Is(err, domain.ErrNodeNotFound) {
+		return node, err
+	}
+	return n.findInOrgs(nodeId)
+}
+
+func (n nodeEtcdRepo) findInOrgs(nodeId domain.NodeId) (*domain.Node, error) {
+	prefix := fmt.Sprintf("%s/orgs/", getKeyPrefix)
+	resp, err := n.etcd.Get(context.TODO(), prefix, etcd.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	suffix := fmt.Sprintf("/%s", nodeId.Value)
+	for _, kv := range resp.Kvs {
+		if !strings.HasSuffix(string(kv.Key), suffix) {
+			continue
+		}
+		node, err := n.nodeMarshaller.Unmarshal(kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		return n.withView(node)
+	}
+	return nil, domain.ErrNodeNotFound
 }
 
 func (n nodeEtcdRepo) ListNodePool() ([]domain.Node, error) {
@@ -125,14 +164,157 @@ func (n nodeEtcdRepo) listNodes(keyPrefix string) ([]domain.Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	desired, err := n.allDesiredOs()
+	if err != nil {
+		return nil, err
+	}
+	seen, err := n.ListSeen()
+	if err != nil {
+		return nil, err
+	}
 	for _, kv := range resp.Kvs {
 		node, err := n.nodeMarshaller.Unmarshal(kv.Value)
 		if err != nil {
 			return nil, err
 		}
+		node.DesiredOsImage = desired[node.Id.Value]
+		node.LastSeen = seen[node.Id.Value]
 		nodes = append(nodes, *node)
 	}
 	return nodes, nil
+}
+
+// PutDesiredOsImage records the OS image the operator declared for a node;
+// nil clears it.
+func (n nodeEtcdRepo) PutDesiredOsImage(nodeId domain.NodeId, image *domain.DesiredOsImage) error {
+	key := desiredOsKey(nodeId)
+	if image == nil {
+		_, err := n.etcd.Delete(context.TODO(), key)
+		return err
+	}
+	value, err := json.Marshal(image)
+	if err != nil {
+		return err
+	}
+	_, err = n.etcd.Put(context.TODO(), key, string(value))
+	return err
+}
+
+func (n nodeEtcdRepo) GetDesiredOsImage(nodeId domain.NodeId) (*domain.DesiredOsImage, error) {
+	resp, err := n.etcd.Get(context.TODO(), desiredOsKey(nodeId))
+	if err != nil {
+		return nil, err
+	}
+	if resp.Count == 0 {
+		return nil, nil
+	}
+	image := &domain.DesiredOsImage{}
+	if err := json.Unmarshal(resp.Kvs[0].Value, image); err != nil {
+		return nil, err
+	}
+	return image, nil
+}
+
+func (n nodeEtcdRepo) withDesiredOs(node *domain.Node) (*domain.Node, error) {
+	image, err := n.GetDesiredOsImage(node.Id)
+	if err != nil {
+		return nil, err
+	}
+	node.DesiredOsImage = image
+	return node, nil
+}
+
+// withView fills the read-time fields of a node: desired OS intent (its own
+// key) and liveness (its own key).
+func (n nodeEtcdRepo) withView(node *domain.Node) (*domain.Node, error) {
+	if _, err := n.withDesiredOs(node); err != nil {
+		return nil, err
+	}
+	seen, err := n.LastSeen(node.Id)
+	if err != nil {
+		return nil, err
+	}
+	node.LastSeen = seen
+	return node, nil
+}
+
+// LastSeen returns the unix seconds of the node's last heartbeat/update,
+// or 0 when the node has never been seen.
+func (n nodeEtcdRepo) LastSeen(nodeId domain.NodeId) (int64, error) {
+	resp, err := n.etcd.Get(context.TODO(), lastSeenKey(nodeId))
+	if err != nil {
+		return 0, err
+	}
+	if resp.Count == 0 {
+		return 0, nil
+	}
+	at, err := strconv.ParseInt(string(resp.Kvs[0].Value), 10, 64)
+	if err != nil {
+		return 0, nil // malformed value: treat as never seen
+	}
+	return at, nil
+}
+
+func (n nodeEtcdRepo) TouchSeen(nodeId domain.NodeId, at int64) error {
+	_, err := n.etcd.Put(context.TODO(), lastSeenKey(nodeId), strconv.FormatInt(at, 10))
+	return err
+}
+
+func (n nodeEtcdRepo) DeleteSeen(nodeId domain.NodeId) error {
+	_, err := n.etcd.Delete(context.TODO(), lastSeenKey(nodeId))
+	return err
+}
+
+func (n nodeEtcdRepo) ListSeen() (map[string]int64, error) {
+	resp, err := n.etcd.Get(context.TODO(), lastSeenKeyPrefix+"/", etcd.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]int64, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		at, err := strconv.ParseInt(string(kv.Value), 10, 64)
+		if err != nil {
+			continue
+		}
+		seen[strings.TrimPrefix(string(kv.Key), lastSeenKeyPrefix+"/")] = at
+	}
+	return seen, nil
+}
+
+// DeleteNode removes everything that belongs to a node. It is the explicit
+// (operator or GC) removal path; Delete above only moves a record between
+// the pool and an org during a claim.
+func (n nodeEtcdRepo) DeleteNode(node domain.Node) error {
+	if err := n.deleteNodeGetModel(node); err != nil {
+		return err
+	}
+	if err := n.deleteNodeQueryModel(node); err != nil {
+		return err
+	}
+	if err := n.DeleteSeen(node.Id); err != nil {
+		return err
+	}
+	return n.PutDesiredOsImage(node.Id, nil)
+}
+
+func (n nodeEtcdRepo) allDesiredOs() (map[string]*domain.DesiredOsImage, error) {
+	resp, err := n.etcd.Get(context.TODO(), desiredOsKeyPrefix+"/", etcd.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	images := make(map[string]*domain.DesiredOsImage, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		image := &domain.DesiredOsImage{}
+		if err := json.Unmarshal(kv.Value, image); err != nil {
+			return nil, err
+		}
+		images[strings.TrimPrefix(string(kv.Key), desiredOsKeyPrefix+"/")] = image
+	}
+	return images, nil
+}
+
+func desiredOsKey(nodeId domain.NodeId) string {
+	return fmt.Sprintf("%s/%s", desiredOsKeyPrefix, nodeId.Value)
 }
 
 func (n nodeEtcdRepo) PutLabel(node domain.Node, label domain.Label) (*domain.Node, error) {
@@ -287,9 +469,17 @@ func (n nodeEtcdRepo) selectNodes(selector domain.Selector, keyPrefix string) ([
 }
 
 const (
-	getKeyPrefix   = "nodes"
-	queryKeyPrefix = "labels"
+	getKeyPrefix       = "nodes"
+	queryKeyPrefix     = "labels"
+	desiredOsKeyPrefix = "desired_os"
+	// lastSeenKeyPrefix is deliberately outside the nodes/ prefix: listNodes
+	// scans nodes/ and must never try to unmarshal liveness values as nodes.
+	lastSeenKeyPrefix = "last_seen"
 )
+
+func lastSeenKey(nodeId domain.NodeId) string {
+	return fmt.Sprintf("%s/%s", lastSeenKeyPrefix, nodeId.Value)
+}
 
 func getKey(node domain.Node) string {
 	if node.Claimed() {

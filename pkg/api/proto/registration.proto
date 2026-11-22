@@ -9,8 +9,41 @@ message RegistrationReq {
   repeated Label labels = 1;
   map<string, double> resources = 2;
   string bindAddress = 3;
+  repeated string capabilities = 4;
+  OsStatus osStatus = 5;
+  // An enrolled agent re-asserts its persisted id when it has to register
+  // again (control-plane reset, record lost). Magnetar then recreates or
+  // updates the same node instead of minting a second UUID. Empty = new node.
+  string nodeId = 6;
 }
 
 message RegistrationResp {
   string NodeId = 1;
+}
+
+message NodeUpdateReq {
+  string nodeId = 1;
+  repeated string capabilities = 2;
+  OsStatus osStatus = 3;
+}
+
+message NodeUpdateResp {
+  // deprecated: read notFound. Still set for agents built against it.
+  bool found = 1;
+  // false by default, so replies from servers without this field never look
+  // like "unknown node"
+  bool notFound = 2;
+}
+
+// NodeHeartbeatReq is sent by every node on its own cadence. It carries no
+// state on purpose: the handler only records liveness, so a heartbeat can
+// never race (and clobber) a capabilities or OS-status report.
+message NodeHeartbeatReq {
+  string nodeId = 1;
+}
+
+message NodeHeartbeatResp {
+  // false when Magnetar has no record of the node: the agent must re-register
+  // (asserting the same id, so the record is recreated, not duplicated).
+  bool found = 1;
 }

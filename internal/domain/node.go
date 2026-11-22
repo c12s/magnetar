@@ -1,11 +1,26 @@
 package domain
 
+import "errors"
+
+// ErrNodeNotFound means the node has no record; any other repo error is a
+// storage failure and must not be treated as "unknown node".
+var ErrNodeNotFound = errors.New("node not found")
+
 type Node struct {
-	Id          NodeId
-	Org         string
-	Labels      []Label
-	Resources   map[string]float64
-	BindAddress string
+	Id             NodeId
+	Org            string
+	Labels         []Label
+	Resources      map[string]float64
+	BindAddress    string
+	Capabilities   []string
+	OsStatus       *OsStatus
+	DesiredOsImage *DesiredOsImage
+	DesiredVms     []DesiredVm
+	VmStatus       []VmStatus
+	// LastSeen (unix seconds) and Liveness are a read-time view joined from
+	// the last_seen key; they are never persisted on the node record.
+	LastSeen int64
+	Liveness string
 }
 
 func (n Node) Claimed() bool {
@@ -27,7 +42,12 @@ type Selector struct {
 type NodeRepo interface {
 	Put(node Node) error
 	Get(nodeId NodeId, org string) (*Node, error)
+	FindById(nodeId NodeId) (*Node, error)
 	Delete(node Node) error
+	// DeleteNode removes a node completely: record, label index, liveness
+	// state and desired OS intent. Delete (above) only moves the record
+	// between pool and org namespaces (claim), so it keeps liveness and intent.
+	DeleteNode(node Node) error
 	ListNodePool() ([]Node, error)
 	ListOrgOwnedNodes(org string) ([]Node, error)
 	QueryNodePool(query Query) ([]Node, error)
@@ -35,6 +55,13 @@ type NodeRepo interface {
 	PutLabel(node Node, label Label) (*Node, error)
 	DeleteLabel(node Node, labelKey string) (*Node, error)
 	ListAllNodes() ([]Node, error)
+	PutDesiredOsImage(nodeId NodeId, image *DesiredOsImage) error
+	GetDesiredOsImage(nodeId NodeId) (*DesiredOsImage, error)
+	// TouchSeen records liveness (unix seconds); ListSeen returns every known
+	// node's last-seen time, for the liveness view and the GC.
+	TouchSeen(nodeId NodeId, at int64) error
+	DeleteSeen(nodeId NodeId) error
+	ListSeen() (map[string]int64, error)
 }
 
 type NodeMarshaller interface {

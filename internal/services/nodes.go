@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"log"
+	"time"
 
 	gravity_api "github.com/c12s/agent_queue/pkg/api"
 	"github.com/c12s/magnetar/internal/domain"
@@ -19,16 +20,36 @@ type NodeService struct {
 	authorizer    AuthZService
 	meridian      meridian_api.MeridianClient
 	gravity       gravity_api.AgentQueueClient
+	liveness      domain.LivenessPolicy
 }
 
-func NewNodeService(nodeRepo domain.NodeRepo, evaluator oortapi.OortEvaluatorClient, administrator *oortapi.AdministrationAsyncClient, authorizer AuthZService, meridian meridian_api.MeridianClient, gravity gravity_api.AgentQueueClient) (*NodeService, error) {
+func NewNodeService(nodeRepo domain.NodeRepo, evaluator oortapi.OortEvaluatorClient, administrator *oortapi.AdministrationAsyncClient, authorizer AuthZService, meridian meridian_api.MeridianClient, gravity gravity_api.AgentQueueClient, liveness domain.LivenessPolicy) (*NodeService, error) {
 	return &NodeService{
 		nodeRepo:      nodeRepo,
 		administrator: administrator,
 		authorizer:    authorizer,
 		meridian:      meridian,
 		gravity:       gravity,
+		liveness:      liveness,
 	}, nil
+}
+
+// markLiveness fills the read-time liveness view. It is computed on read
+// (not stored) so that a control-plane outage only degrades the display and
+// never rewrites state.
+func (n *NodeService) markLiveness(nodes []domain.Node) {
+	n.liveness.MarkAll(nodes, time.Now())
+}
+
+// DeleteNode removes a node record and everything attached to it: label
+// index, liveness state and desired OS intent. Authorization happens in the
+// server layer, like SetDesiredOsImage.
+func (n *NodeService) DeleteNode(id domain.NodeId) error {
+	node, err := n.nodeRepo.FindById(id)
+	if err != nil {
+		return err
+	}
+	return n.nodeRepo.DeleteNode(*node)
 }
 
 func (n *NodeService) GetFromNodePool(ctx context.Context, req domain.GetFromNodePoolReq) (*domain.GetFromNodePoolResp, error) {
@@ -36,6 +57,7 @@ func (n *NodeService) GetFromNodePool(ctx context.Context, req domain.GetFromNod
 	if err != nil {
 		return nil, err
 	}
+	n.liveness.Mark(node, time.Now())
 	return &domain.GetFromNodePoolResp{
 		Node: *node,
 	}, nil
@@ -49,6 +71,7 @@ func (n *NodeService) GetFromOrg(ctx context.Context, req domain.GetFromOrgReq) 
 	if err != nil {
 		return nil, err
 	}
+	n.liveness.Mark(node, time.Now())
 	return &domain.GetFromOrgResp{
 		Node: *node,
 	}, nil
@@ -96,6 +119,7 @@ func (n *NodeService) ClaimOwnership(ctx context.Context, req domain.ClaimOwners
 			log.Println(err)
 		}
 	}
+	n.markLiveness(nodes)
 	// upsert ns
 	listNodesResp, err := n.ListOrgOwnedNodes(ctx, domain.ListOrgOwnedNodesReq{
 		Org: req.Org,
@@ -176,6 +200,7 @@ func (n *NodeService) ListNodePool(ctx context.Context, req domain.ListNodePoolR
 	if err != nil {
 		return nil, err
 	}
+	n.markLiveness(nodes)
 	return &domain.ListNodePoolResp{
 		Nodes: nodes,
 	}, nil
@@ -189,13 +214,19 @@ func (n *NodeService) ListOrgOwnedNodes(ctx context.Context, req domain.ListOrgO
 	if err != nil {
 		return nil, err
 	}
+	n.markLiveness(nodes)
 	return &domain.ListOrgOwnedNodesResp{
 		Nodes: nodes,
 	}, nil
 }
 
 func (n *NodeService) ListAllNodes(ctx context.Context) ([]domain.Node, error) {
-	return n.nodeRepo.ListAllNodes()
+	nodes, err := n.nodeRepo.ListAllNodes()
+	if err != nil {
+		return nil, err
+	}
+	n.markLiveness(nodes)
+	return nodes, nil
 }
 
 func (n *NodeService) QueryNodePool(ctx context.Context, req domain.QueryNodePoolReq) (*domain.QueryNodePoolResp, error) {
@@ -203,6 +234,7 @@ func (n *NodeService) QueryNodePool(ctx context.Context, req domain.QueryNodePoo
 	if err != nil {
 		return nil, err
 	}
+	n.markLiveness(nodes)
 	return &domain.QueryNodePoolResp{
 		Nodes: nodes,
 	}, nil
@@ -216,6 +248,7 @@ func (n *NodeService) QueryOrgOwnedNodes(ctx context.Context, req domain.QueryOr
 	if err != nil {
 		return nil, err
 	}
+	n.markLiveness(nodes)
 	return &domain.QueryOrgOwnedNodesResp{
 		Nodes: nodes,
 	}, nil

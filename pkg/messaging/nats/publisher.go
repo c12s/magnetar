@@ -11,7 +11,9 @@ type publisher struct {
 }
 
 func NewPublisher(conn *nats.Conn) (messaging.Publisher, error) {
-	if conn == nil || !conn.IsConnected() {
+	// a connection that is still (re)connecting buffers publishes; only a
+	// closed one is unusable
+	if conn == nil || conn.IsClosed() {
 		return nil, errors.New("connection error")
 	}
 	return &publisher{

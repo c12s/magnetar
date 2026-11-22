@@ -19,13 +19,28 @@ type MagnetarGrpcServer struct {
 	api.UnimplementedMagnetarServer
 	nodeService  services.NodeService
 	labelService services.LabelService
+	vmService    services.VmService
+	osService    services.OsService
+	authorizer   services.AuthZService
 }
 
-func NewMagnetarGrpcServer(nodeService services.NodeService, labelService services.LabelService) (api.MagnetarServer, error) {
+func NewMagnetarGrpcServer(nodeService services.NodeService, labelService services.LabelService, vmService services.VmService, osService services.OsService, authorizer services.AuthZService) (api.MagnetarServer, error) {
 	return &MagnetarGrpcServer{
 		nodeService:  nodeService,
 		labelService: labelService,
+		vmService:    vmService,
+		osService:    osService,
+		authorizer:   authorizer,
 	}, nil
+}
+
+// authorizeHost guards the user-facing VM endpoints; hosts reach the same
+// data over NATS (VmAsyncServer) without a user token.
+func (m *MagnetarGrpcServer) authorizeHost(ctx context.Context, permission, hostId string) error {
+	if !m.authorizer.Authorize(ctx, permission, "node", hostId) {
+		return status.Error(codes.PermissionDenied, domain.ErrForbidden.Error())
+	}
+	return nil
 }
 
 func (m *MagnetarGrpcServer) GetFromNodePool(ctx context.Context, req *api.GetFromNodePoolReq) (*api.GetFromNodePoolResp, error) {
@@ -209,6 +224,66 @@ func (m *MagnetarGrpcServer) ListAllNodes(ctx context.Context, req *api.ListAllN
 	return proto.ListAlldNodesRespFromDomain(nodes)
 }
 
+func (m *MagnetarGrpcServer) SetDesiredVms(ctx context.Context, req *api.VmDesiredSetReq) (*api.VmDesiredSetResp, error) {
+	hostId, vms, err := proto.VmDesiredSetReqToDomain(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := m.authorizeHost(ctx, "node.put", hostId.Value); err != nil {
+		return nil, err
+	}
+	stored, err := m.vmService.SetDesiredVms(hostId, vms)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, err
+	}
+	return proto.VmDesiredSetRespFromDomain(stored), nil
+}
+
+func (m *MagnetarGrpcServer) GetDesiredVms(ctx context.Context, req *api.VmDesiredGetReq) (*api.VmDesiredGetResp, error) {
+	if err := m.authorizeHost(ctx, "node.get", req.HostId); err != nil {
+		return nil, err
+	}
+	vms, err := m.vmService.GetDesiredVms(proto.VmDesiredGetReqToDomain(req))
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, err
+	}
+	return proto.VmDesiredGetRespFromDomain(vms), nil
+}
+
+func (m *MagnetarGrpcServer) GetVmStatuses(ctx context.Context, req *api.VmStatusGetReq) (*api.VmStatusGetResp, error) {
+	if err := m.authorizeHost(ctx, "node.get", req.HostId); err != nil {
+		return nil, err
+	}
+	statuses, err := m.vmService.GetVmStatuses(proto.VmStatusGetReqToDomain(req))
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, err
+	}
+	return proto.VmStatusGetRespFromDomain(statuses), nil
+}
+
+func (m *MagnetarGrpcServer) SetVmStatuses(ctx context.Context, req *api.VmStatusSetReq) (*api.VmStatusSetResp, error) {
+	hostId, statuses := proto.VmStatusSetReqToDomain(req)
+	if err := m.authorizeHost(ctx, "node.put", hostId.Value); err != nil {
+		return nil, err
+	}
+	if err := m.vmService.SetVmStatuses(hostId, statuses); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, err
+	}
+	return &api.VmStatusSetResp{}, nil
+}
+
 func GetAuthInterceptor() func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		md, ok := metadata.FromIncomingContext(ctx)
@@ -218,4 +293,48 @@ func GetAuthInterceptor() func(ctx context.Context, req interface{}, info *grpc.
 		// Calls the handler
 		return handler(ctx, req)
 	}
+}
+
+// SetDesiredOsImage records the operator's OS intent for a node (called by
+// gravity before it notifies the node). Same permission as the update itself:
+// os.update on the node or on its org.
+func (m *MagnetarGrpcServer) SetDesiredOsImage(ctx context.Context, req *api.DesiredOsImageSetReq) (*api.DesiredOsImageSetResp, error) {
+	if req.NodeId == "" {
+		return nil, status.Error(codes.InvalidArgument, "nodeId is required")
+	}
+	// a per-node grant, or a grant on the node's org
+	switch err := m.osService.AuthorizeOsUpdate(ctx, m.authorizer, domain.NodeId{Value: req.NodeId}); {
+	case errors.Is(err, domain.ErrNodeNotFound):
+		return nil, status.Error(codes.NotFound, err.Error())
+	case err != nil:
+		return nil, status.Error(codes.PermissionDenied, domain.ErrForbidden.Error())
+	}
+	err := m.osService.SetDesiredOsImage(domain.NodeId{Value: req.NodeId}, proto.DesiredOsImageToDomain(req.Image))
+	if errors.Is(err, domain.ErrNodeNotFound) {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &api.DesiredOsImageSetResp{}, nil
+}
+
+// DeleteNode removes a node record completely (record, label index, liveness
+// state, desired OS intent). Org-owned nodes are never removed automatically:
+// this is the explicit operator path for them.
+func (m *MagnetarGrpcServer) DeleteNode(ctx context.Context, req *api.DeleteNodeReq) (*api.DeleteNodeResp, error) {
+	if req.NodeId == "" {
+		return nil, status.Error(codes.InvalidArgument, "nodeId is required")
+	}
+	if err := m.authorizeHost(ctx, "node.delete", req.NodeId); err != nil {
+		return nil, err
+	}
+	err := m.nodeService.DeleteNode(domain.NodeId{Value: req.NodeId})
+	if errors.Is(err, domain.ErrNodeNotFound) {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &api.DeleteNodeResp{}, nil
 }

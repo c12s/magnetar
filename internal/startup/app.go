@@ -31,16 +31,29 @@ type app struct {
 	grpcServer                *grpc.Server
 	magnetarServer            api.MagnetarServer
 	registrationServer        *servers.RegistrationAsyncServer
+	nodeUpdateServer          *servers.NodeUpdateAsyncServer
+	heartbeatServer           *servers.HeartbeatAsyncServer
+	nodeGC                    *services.NodeGC
+	vmAsyncServer             *servers.VmAsyncServer
+	osAsyncServer             *servers.OsAsyncServer
+	osService                 *services.OsService
+	osDesiredGetSubscriber    messaging.Subscriber
 	nodeService               *services.NodeService
 	labelService              *services.LabelService
+	vmService                 *services.VmService
 	authzService              services.AuthZService
 	registrationService       *services.RegistrationService
+	nodeUpdateService         *services.NodeUpdateService
 	evaluatorClient           oortapi.OortEvaluatorClient
 	administratorClient       *oortapi.AdministrationAsyncClient
 	meridian                  meridian_api.MeridianClient
 	gravity                   gravity_api.AgentQueueClient
 	publisher                 messaging.Publisher
 	registrationSubscriber    messaging.Subscriber
+	nodeUpdateSubscriber      messaging.Subscriber
+	heartbeatSubscriber       messaging.Subscriber
+	vmDesiredGetSubscriber    messaging.Subscriber
+	vmStatusSetSubscriber     messaging.Subscriber
 	nodeRepo                  domain.NodeRepo
 	nodeMarshaller            domain.NodeMarshaller
 	labelMarshaller           domain.LabelMarshaller
@@ -63,6 +76,26 @@ func (a *app) Start() error {
 	a.init()
 
 	err := a.startRegistrationServer()
+	if err != nil {
+		return err
+	}
+	err = a.startNodeUpdateServer()
+	if err != nil {
+		return err
+	}
+	err = a.startHeartbeatServer()
+	if err != nil {
+		return err
+	}
+	err = a.startNodeGC()
+	if err != nil {
+		return err
+	}
+	err = a.startVmAsyncServer()
+	if err != nil {
+		return err
+	}
+	err = a.startOsAsyncServer()
 	if err != nil {
 		return err
 	}
@@ -121,6 +154,9 @@ func (a *app) init() {
 
 	a.initNatsPublisher(natsConn)
 	a.initRegistrationNatsSubscriber(natsConn)
+	a.initNodeUpdateNatsSubscriber(natsConn)
+	a.initHeartbeatNatsSubscriber(natsConn)
+	a.initVmNatsSubscribers(natsConn)
 
 	a.initNodeProtoMarshaller()
 	a.initLabelProtoMarshaller()
@@ -134,9 +170,17 @@ func (a *app) init() {
 	a.initAuthZService()
 	a.initNodeService()
 	a.initLabelService()
+	a.initVmService()
+	a.initOsService()
 	a.initRegistrationService()
+	a.initNodeUpdateService()
 
 	a.initRegistrationServer()
+	a.initNodeUpdateServer()
+	a.initHeartbeatServer()
+	a.initNodeGC()
+	a.initVmAsyncServer()
+	a.initOsAsyncServer()
 	a.initMagnetarServer()
 	a.initGrpcServer()
 }
@@ -158,7 +202,10 @@ func (a *app) initMagnetarServer() {
 	if a.labelService == nil {
 		log.Fatalln("label service is nil")
 	}
-	magnetarServer, err := servers.NewMagnetarGrpcServer(*a.nodeService, *a.labelService)
+	if a.vmService == nil {
+		log.Fatalln("vm service is nil")
+	}
+	magnetarServer, err := servers.NewMagnetarGrpcServer(*a.nodeService, *a.labelService, *a.vmService, *a.osService, a.authzService)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -193,6 +240,121 @@ func (a *app) initRegistrationService() {
 	a.registrationService = registrationService
 }
 
+func (a *app) initNodeUpdateService() {
+	if a.nodeRepo == nil {
+		log.Fatalln("node repo is nil")
+	}
+	nodeUpdateService, err := services.NewNodeUpdateService(a.nodeRepo)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.nodeUpdateService = nodeUpdateService
+}
+
+func (a *app) initVmService() {
+	if a.nodeRepo == nil {
+		log.Fatalln("node repo is nil")
+	}
+	vmService, err := services.NewVmService(a.nodeRepo)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.vmService = vmService
+}
+
+func (a *app) initOsService() {
+	osService, err := services.NewOsService(a.nodeRepo)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.osService = osService
+}
+
+func (a *app) initOsAsyncServer() {
+	server, err := servers.NewOsAsyncServer(a.osDesiredGetSubscriber, a.publisher, *a.osService)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.osAsyncServer = server
+}
+
+func (a *app) startOsAsyncServer() error {
+	if err := a.osAsyncServer.Serve(); err != nil {
+		return err
+	}
+	a.gracefulShutdownProcesses = append(a.gracefulShutdownProcesses, func(wg *sync.WaitGroup) {
+		a.osAsyncServer.GracefulStop()
+		log.Println("os async server gracefully stopped")
+		wg.Done()
+	})
+	return nil
+}
+
+func (a *app) initVmAsyncServer() {
+	if a.vmService == nil {
+		log.Fatalln("vm service is nil")
+	}
+	if a.publisher == nil {
+		log.Fatalln("publisher is nil")
+	}
+	if a.vmDesiredGetSubscriber == nil {
+		log.Fatalln("vm desired get subscriber is nil")
+	}
+	if a.vmStatusSetSubscriber == nil {
+		log.Fatalln("vm status set subscriber is nil")
+	}
+	server, err := servers.NewVmAsyncServer(a.vmDesiredGetSubscriber, a.vmStatusSetSubscriber, a.publisher, *a.vmService)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.vmAsyncServer = server
+}
+
+func (a *app) initHeartbeatServer() {
+	if a.nodeUpdateService == nil {
+		log.Fatalln("node update service is nil")
+	}
+	if a.publisher == nil {
+		log.Fatalln("publisher is nil")
+	}
+	if a.heartbeatSubscriber == nil {
+		log.Fatalln("heartbeat subscriber is nil")
+	}
+	server, err := servers.NewHeartbeatAsyncServer(a.heartbeatSubscriber, a.publisher, *a.nodeUpdateService)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.heartbeatServer = server
+}
+
+func (a *app) initNodeGC() {
+	if a.nodeRepo == nil {
+		log.Fatalln("node repo is nil")
+	}
+	nodeGC, err := services.NewNodeGC(a.nodeRepo, a.config.GCPoolAfter())
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.nodeGC = nodeGC
+}
+
+func (a *app) initNodeUpdateServer() {
+	if a.nodeUpdateService == nil {
+		log.Fatalln("node update service is nil")
+	}
+	if a.publisher == nil {
+		log.Fatalln("publisher is nil")
+	}
+	if a.nodeUpdateSubscriber == nil {
+		log.Fatalln("node update subscriber is nil")
+	}
+	server, err := servers.NewNodeUpdateAsyncServer(a.nodeUpdateSubscriber, a.publisher, *a.nodeUpdateService)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.nodeUpdateServer = server
+}
+
 func (a *app) initNodeService() {
 	if a.nodeRepo == nil {
 		log.Fatalln("node repo is nil")
@@ -203,7 +365,8 @@ func (a *app) initNodeService() {
 	if a.gravity == nil {
 		log.Fatalln("gravity is nil")
 	}
-	nodeService, err := services.NewNodeService(a.nodeRepo, a.evaluatorClient, a.administratorClient, a.authzService, a.meridian, a.gravity)
+	nodeService, err := services.NewNodeService(a.nodeRepo, a.evaluatorClient, a.administratorClient, a.authzService, a.meridian, a.gravity,
+		domain.LivenessPolicy{StaleAfter: a.config.StaleAfter(), OfflineAfter: a.config.OfflineAfter()})
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -274,6 +437,42 @@ func (a *app) initRegistrationNatsSubscriber(conn *natsgo.Conn) {
 	a.registrationSubscriber = registrationSubscriber
 }
 
+func (a *app) initNodeUpdateNatsSubscriber(conn *natsgo.Conn) {
+	nodeUpdateSubscriber, err := nats.NewSubscriber(conn, api.NodeUpdateSubject, "magnetar")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.nodeUpdateSubscriber = nodeUpdateSubscriber
+}
+
+func (a *app) initHeartbeatNatsSubscriber(conn *natsgo.Conn) {
+	heartbeatSubscriber, err := nats.NewSubscriber(conn, api.NodeHeartbeatSubject, "magnetar")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.heartbeatSubscriber = heartbeatSubscriber
+}
+
+func (a *app) initVmNatsSubscribers(conn *natsgo.Conn) {
+	desiredGetSubscriber, err := nats.NewSubscriber(conn, api.VmDesiredGetSubject, "magnetar")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.vmDesiredGetSubscriber = desiredGetSubscriber
+
+	statusSetSubscriber, err := nats.NewSubscriber(conn, api.VmStatusSetSubject, "magnetar")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.vmStatusSetSubscriber = statusSetSubscriber
+
+	osDesiredGetSubscriber, err := nats.NewSubscriber(conn, api.OsDesiredGetSubject, "magnetar")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	a.osDesiredGetSubscriber = osDesiredGetSubscriber
+}
+
 func (a *app) initNodeEtcdRepo(client *etcd.Client) {
 	nodeRepo, err := repos.NewNodeEtcdRepo(client, a.nodeMarshaller, a.labelMarshaller)
 	if err != nil {
@@ -298,6 +497,56 @@ func (a *app) startRegistrationServer() error {
 	a.gracefulShutdownProcesses = append(a.gracefulShutdownProcesses, func(wg *sync.WaitGroup) {
 		a.registrationServer.GracefulStop()
 		log.Println("registration server gracefully stopped")
+		wg.Done()
+	})
+	return nil
+}
+
+func (a *app) startNodeUpdateServer() error {
+	err := a.nodeUpdateServer.Serve()
+	if err != nil {
+		return err
+	}
+	a.gracefulShutdownProcesses = append(a.gracefulShutdownProcesses, func(wg *sync.WaitGroup) {
+		a.nodeUpdateServer.GracefulStop()
+		log.Println("node update server gracefully stopped")
+		wg.Done()
+	})
+	return nil
+}
+
+func (a *app) startHeartbeatServer() error {
+	if err := a.heartbeatServer.Serve(); err != nil {
+		return err
+	}
+	a.gracefulShutdownProcesses = append(a.gracefulShutdownProcesses, func(wg *sync.WaitGroup) {
+		a.heartbeatServer.GracefulStop()
+		log.Println("heartbeat server gracefully stopped")
+		wg.Done()
+	})
+	return nil
+}
+
+func (a *app) startNodeGC() error {
+	if !a.config.GCEnabled() {
+		log.Println("node gc disabled (NODE_GC_ENABLED)")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.shutdownProcesses = append(a.shutdownProcesses, cancel)
+	go a.nodeGC.Run(ctx, a.config.GCInterval())
+	log.Printf("node gc running every %s (pool records older than %s)", a.config.GCInterval(), a.config.GCPoolAfter())
+	return nil
+}
+
+func (a *app) startVmAsyncServer() error {
+	err := a.vmAsyncServer.Serve()
+	if err != nil {
+		return err
+	}
+	a.gracefulShutdownProcesses = append(a.gracefulShutdownProcesses, func(wg *sync.WaitGroup) {
+		a.vmAsyncServer.GracefulStop()
+		log.Println("vm async server gracefully stopped")
 		wg.Done()
 	})
 	return nil

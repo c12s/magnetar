@@ -143,7 +143,7 @@ func (c ComparisonResult) String() string {
 
 func NewCompResultFromString(value string) (ComparisonResult, error) {
 	switch value {
-	case eqString:
+	case eqString, "==":
 		return CompResEq, nil
 	case neqString:
 		return CompResNeq, nil
@@ -152,7 +152,7 @@ func NewCompResultFromString(value string) (ComparisonResult, error) {
 	case gtString:
 		return CompResGt, nil
 	default:
-		return CompResEq, errors.New("invalid string")
+		return CompResEq, errors.New("invalid comparison operator: " + value)
 	}
 }
 
